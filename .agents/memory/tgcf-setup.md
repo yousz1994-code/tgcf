@@ -23,3 +23,14 @@ Must be called before `read_config()` in any page that needs credentials.
 Removed `from run import package_dir` (broken import). Now uses `_get_package_dir()` helper internally.
 
 **Why:** `run` module not in sys.path when Streamlit runs pages directly.
+
+## Admin Bot Session — CRITICAL
+The admin bot MUST use `StringSession()` (in-memory), NOT a file-based session string like "tgcf_admin_bot".
+File-based sessions cause "database is locked" when Streamlit and tgcf live both try to open the same SQLite file.
+
+**Why:** Multiple processes/threads cannot share the same SQLite session file safely.
+**How to apply:** Always `TelegramClient(StringSession(), api_id, api_hash)` for bots started in background threads.
+
+## Auto-start admin bot
+`0_👋_Hello.py` calls `start_admin_bot()` on first Streamlit load so the bot is available without running tgcf live mode.
+`live.py:start_sync()` also calls `start_admin_bot()` so it also runs in live forwarding mode.

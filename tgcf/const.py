@@ -1,10 +1,17 @@
 """Declare all global constants."""
 
 COMMANDS = {
-    "start": "Check whether I am alive",
-    "forward": "Set a new forward",
-    "remove": "Remove an existing forward",
-    "help": "Learn usage",
+    "start":               "القائمة الرئيسية",
+    "help":                "المساعدة وقائمة الأوامر",
+    "stats":               "الإحصائيات العامة",
+    "health":              "فحص صحة النظام",
+    "connections":         "إدارة الروابط",
+    "reports":             "تقارير التحويل",
+    "userbot":             "حالة Userbot",
+    "session":             "معلومات الجلسة",
+    "restart_userbot":     "إعادة تشغيل Userbot",
+    "reload_connections":  "إعادة تحميل الروابط",
+    "ping":                "اختبار الاستجابة",
 }
 
 REGISTER_COMMANDS = True

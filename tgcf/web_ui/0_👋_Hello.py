@@ -6,6 +6,14 @@ from tgcf.config import read_config
 
 CONFIG = read_config()
 
+# Auto-start admin bot on app load
+try:
+    from tgcf.bot.admin_bot import start_admin_bot, get_bot_status
+    if not get_bot_status().get("running"):
+        start_admin_bot()
+except Exception:
+    pass
+
 st.set_page_config(
     page_title="Hello",
     page_icon="👋",

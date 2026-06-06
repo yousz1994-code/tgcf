@@ -152,6 +152,14 @@ async def start_sync() -> None:
     except Exception as e:
         logging.warning(f"DB init: {e}")
 
+    # Start admin bot in background
+    try:
+        from tgcf.bot.admin_bot import start_admin_bot
+        start_admin_bot()
+        logging.info("Admin bot started in background.")
+    except Exception as e:
+        logging.warning(f"Admin bot start failed: {e}")
+
     clean_session_files()
     await load_async_plugins()
 
@@ -192,7 +200,7 @@ async def start_sync() -> None:
         await client(
             functions.bots.SetBotCommandsRequest(
                 scope=types.BotCommandScopeDefault(),
-                lang_code="en",
+                lang_code="ar",
                 commands=[
                     types.BotCommand(command=key, description=value)
                     for key, value in const.COMMANDS.items()
@@ -210,9 +218,9 @@ async def start_sync() -> None:
         from tgcf.db import get_all_connections, update_connection_source_id
         conns = get_all_connections()
         for c in conns:
-            src_name = c.get("source_username", "")
             for sid, _ in config.from_to.items():
-                update_connection_source_id(c["id"], sid)
+                if str(c.get("source_username")) in [str(f.source) for f in cfg.forwards]:
+                    update_connection_source_id(c["id"], sid)
     except Exception as e:
         logging.warning(f"DB sync: {e}")
 

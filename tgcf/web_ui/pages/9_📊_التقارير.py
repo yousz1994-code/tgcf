@@ -114,6 +114,33 @@ if check_password(st):
 
     st.divider()
 
+    st.markdown("### 🤖 حالة النظام")
+    sys1, sys2 = st.columns(2)
+    with sys1:
+        try:
+            from tgcf.userbot import get_status as ub_status
+            ub = ub_status()
+            if ub.get("connected"):
+                me_ub = ub.get("me") or {}
+                st.success(f"🟢 Userbot — @{me_ub.get('username', '')}")
+            else:
+                st.error(f"🔴 Userbot غير متصل — {ub.get('error', '—')}")
+        except Exception as e:
+            st.warning(f"Userbot: {e}")
+    with sys2:
+        try:
+            from tgcf.bot.admin_bot import get_bot_status
+            bs = get_bot_status()
+            if bs.get("running"):
+                bme = bs.get("me") or {}
+                st.success(f"🟢 بوت الإدارة — @{bme.get('username', '')}")
+            else:
+                st.warning(f"🟡 بوت الإدارة: {bs.get('error', 'غير نشط')}")
+        except Exception as e:
+            st.warning(f"بوت الإدارة: {e}")
+
+    st.divider()
+
     st.markdown("### 🔧 أدوات قاعدة البيانات")
     with st.expander("🗄️ حالة قاعدة البيانات"):
         try:

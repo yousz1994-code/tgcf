@@ -1,3 +1,3 @@
-- [tgcf-project-setup](tgcf-setup.md) — Streamlit 1.25.0 app; no border=True/page_link/link_button; all creds loaded from Replit Secrets via config_env.py
+- [tgcf-project-setup](tgcf-setup.md) — Streamlit 1.25.0 limits + admin bot MUST use StringSession() not file session (prevents SQLite lock)
 - [userbot-session](userbot-session.md) — Userbot @Y9_S4 id=8511180085; SESSION_STRING in Replit Secrets; auto-connects via tgcf/userbot.py on import
 - [db-layer](db-layer.md) — PostgreSQL via DATABASE_URL; tables: connections + message_logs; initialized in tgcf/db.py on import
