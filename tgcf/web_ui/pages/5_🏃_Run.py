@@ -6,8 +6,11 @@ import time
 import streamlit as st
 
 from tgcf.config import CONFIG, read_config, write_config
+from tgcf.config_env import load_env_into_config
 from tgcf.web_ui.password import check_password
 from tgcf.web_ui.utils import hide_st, switch_theme
+
+load_env_into_config()
 
 CONFIG = read_config()
 

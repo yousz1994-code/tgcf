@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 
 from tgcf.web_ui.utils import hide_st, switch_theme
@@ -8,9 +9,11 @@ CONFIG = read_config()
 st.set_page_config(
     page_title="Hello",
     page_icon="👋",
+    layout="wide",
 )
 hide_st(st)
-switch_theme(st,CONFIG)
+switch_theme(st, CONFIG)
+
 st.write("# Welcome to tgcf 👋")
 
 html = """
@@ -18,30 +21,83 @@ html = """
 <img src = "https://user-images.githubusercontent.com/66209958/115183360-3fa4d500-a0f9-11eb-9c0f-c5ed03a9ae17.png" alt = "tgcf logo"  width=120>
 </p>
 """
-
 st.components.v1.html(html, width=None, height=None, scrolling=False)
-with st.expander("Features"):
-    st.markdown(
-        """
-    tgcf is the ultimate tool to automate custom telegram message forwarding.
 
-    The key features are:
+# ── Userbot status banner ───────────────────────────────────────────────────
+try:
+    from tgcf.userbot import get_status
+    ub = get_status()
+    if ub.get("connected") and ub.get("me"):
+        me = ub["me"]
+        st.success(f"🟢 Userbot متصل: **{me.get('name','')}** (@{me.get('username','')})")
+    else:
+        err = ub.get("error", "غير متصل")
+        st.error(f"🔴 Userbot غير متصل — {err}")
+except Exception as e:
+    st.warning(f"Userbot: {e}")
 
-    - Forward messages as "forwarded" or send a copy of the messages from source to destination chats. A chat can be anything: a group, channel, person or even another bot.
+st.divider()
 
-    - Supports two modes of operation past or live. The past mode deals with all existing messages, while the live mode is for upcoming ones.
+# ── Quick Action Buttons ────────────────────────────────────────────────────
+st.markdown("### 🎛️ لوحة التحكم السريعة")
+col1, col2, col3, col4 = st.columns(4)
 
-    - You may login with a bot or an user account. Telegram imposes certain limitations on bot accounts. You may use an user account to perform the forwards if you wish.
+with col1:
+    st.markdown("**📢 قناة الدعم**")
+    if st.button("📢 قناة الدعم", use_container_width=True, key="btn_support"):
+        st.session_state["show_support"] = not st.session_state.get("show_support", False)
+    if st.session_state.get("show_support", False):
+        st.markdown("[🔗 قناة الدعم](https://t.me/shaheenys)")
 
-    - Perform custom manipulation on messages. You can filter, format, replace, watermark, ocr and do whatever else you need !
+with col2:
+    st.markdown("**🎁 الهدية اليومية**")
+    if st.button("🎁 الهدية اليومية", use_container_width=True, key="btn_gift"):
+        st.session_state["show_gift"] = not st.session_state.get("show_gift", False)
+    if st.session_state.get("show_gift", False):
+        st.markdown("[🔗 الهدية اليومية](https://t.me/fi1_oo)")
 
-    - Detailed wiki + Video tutorial. You can also get help from the community.
+with col3:
+    st.markdown("**📋 قنواتي المرتبطة**")
+    st.info("📋 اذهب إلى الصفحة من القائمة الجانبية")
 
-    - If you are a python developer, writing plugins for tgcf is like stealing candy from a baby. Plugins modify the message before they are sent to the destination chat.
+with col4:
+    st.markdown("**🤖 USERBOT Panel**")
+    st.info("🤖 اذهب إلى الصفحة من القائمة الجانبية")
 
-    What are you waiting for? Star the repo and click Watch to recieve updates.
+st.divider()
 
-        """
-    )
+# ── Global Stats ────────────────────────────────────────────────────────────
+st.markdown("### 📊 الإحصائيات العامة")
+try:
+    from tgcf.db import get_global_stats, get_today_stats, get_all_connections, init_db
+    init_db()
+    gs = get_global_stats()
+    ts = get_today_stats()
+    conns = get_all_connections()
+
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("🔗 الاتصالات", len(conns))
+    s2.metric("📨 إجمالي الرسائل", int(gs.get("total_messages") or 0))
+    s3.metric("✅ محوَّل", int(gs.get("total_forwarded") or 0))
+    s4.metric("📅 اليوم", int(ts.get("total_messages") or 0))
+    total = int(gs.get("total_messages") or 0)
+    fwd = int(gs.get("total_forwarded") or 0)
+    rate = f"{fwd/total*100:.1f}%" if total > 0 else "—"
+    s5.metric("📈 نسبة النجاح", rate)
+except Exception as e:
+    st.info(f"الإحصائيات غير متاحة: {e}")
+
+st.divider()
+
+with st.expander("ℹ️ Features"):
+    st.markdown("""
+tgcf is the ultimate tool to automate custom telegram message forwarding.
+
+- Forward messages as "forwarded" or send a copy from source to destination chats.
+- Supports **live** mode (real-time) and **past** mode (history).
+- Login with a bot or userbot account.
+- Custom plugins: filter, format, replace, watermark, OCR, captions.
+- Full connection dashboard with real statistics.
+    """)
 
 st.warning("Please press Save after changing any config.")

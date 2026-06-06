@@ -28,6 +28,7 @@ streamlit = "1.25.0"
 altair = "4.2.2"
 PyYAML = "^6.0"
 pymongo = "^4.3.3"
+psycopg2-binary = "^2.9.12"
 
 [tool.poetry.dev-dependencies]
 black = {version = "^22.10.0", allow-prereleases = true}

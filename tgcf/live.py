@@ -17,6 +17,26 @@ from tgcf.plugins import apply_plugins, load_async_plugins
 from tgcf.utils import clean_session_files, send_message
 
 
+def _try_log(connection_id, con_name, source_id, dest_id, status, preview=""):
+    try:
+        from tgcf.db import log_message
+        log_message(connection_id, con_name, source_id, dest_id, status, preview)
+    except Exception as e:
+        logging.debug(f"DB log skipped: {e}")
+
+
+def _get_connection_id(chat_id: int):
+    try:
+        from tgcf.db import get_all_connections
+        conns = get_all_connections()
+        for c in conns:
+            if c.get("source_id") == chat_id:
+                return c["id"], c.get("con_name", "")
+        return None, str(chat_id)
+    except Exception:
+        return None, str(chat_id)
+
+
 async def new_message_handler(event: Union[Message, events.NewMessage]) -> None:
     """Process new incoming messages."""
     chat_id = event.chat_id
@@ -25,12 +45,12 @@ async def new_message_handler(event: Union[Message, events.NewMessage]) -> None:
         return
     logging.info(f"New message received in {chat_id}")
     message = event.message
+    preview = (message.text or "")[:200] if message else ""
 
     event_uid = st.EventUid(event)
 
     length = len(st.stored)
     exceeding = length - const.KEEP_LAST_MANY
-
     if exceeding > 0:
         for key in st.stored:
             del st.stored[key]
@@ -46,28 +66,32 @@ async def new_message_handler(event: Union[Message, events.NewMessage]) -> None:
         r_event = st.DummyEvent(chat_id, event.reply_to_msg_id)
         r_event_uid = st.EventUid(r_event)
 
+    cid, con_name = _get_connection_id(chat_id)
+
     st.stored[event_uid] = {}
     for d in dest:
         if event.is_reply and r_event_uid in st.stored:
             tm.reply_to = st.stored.get(r_event_uid).get(d)
-        fwded_msg = await send_message(d, tm)
-        st.stored[event_uid].update({d: fwded_msg})
+        try:
+            fwded_msg = await send_message(d, tm)
+            st.stored[event_uid].update({d: fwded_msg})
+            _try_log(cid, con_name, chat_id, d, "ok", preview)
+        except Exception as e:
+            logging.error(f"Failed to forward to {d}: {e}")
+            _try_log(cid, con_name, chat_id, d, "fail", preview)
     tm.clear()
 
 
 async def edited_message_handler(event) -> None:
     """Handle message edits."""
     message = event.message
-
     chat_id = event.chat_id
 
     if chat_id not in config.from_to:
         return
 
     logging.info(f"Message edited in {chat_id}")
-
     event_uid = st.EventUid(event)
-
     tm = await apply_plugins(message)
 
     if not tm:
@@ -85,7 +109,6 @@ async def edited_message_handler(event) -> None:
         return
 
     dest = config.from_to.get(chat_id)
-
     for d in dest:
         await send_message(d, tm)
     tm.clear()
@@ -98,7 +121,6 @@ async def deleted_message_handler(event):
         return
 
     logging.info(f"Message deleted in {chat_id}")
-
     event_uid = st.EventUid(event)
     fwded_msgs = st.stored.get(event_uid)
     if fwded_msgs:
@@ -116,26 +138,42 @@ ALL_EVENTS = {
 
 async def start_sync() -> None:
     """Start tgcf live sync."""
-    # clear past session files
-    clean_session_files()
+    # Load credentials from env vars into config
+    try:
+        from tgcf.config_env import load_env_into_config
+        load_env_into_config()
+    except Exception as e:
+        logging.warning(f"config_env load: {e}")
 
-    # load async plugins defined in plugin_models
+    # Init DB
+    try:
+        from tgcf.db import init_db
+        init_db()
+    except Exception as e:
+        logging.warning(f"DB init: {e}")
+
+    clean_session_files()
     await load_async_plugins()
 
-    SESSION = get_SESSION()
+    # Re-read config after env load
+    from tgcf.config import read_config
+    cfg = read_config()
+
+    SESSION = get_SESSION(cfg.login)
     client = TelegramClient(
         SESSION,
-        CONFIG.login.API_ID,
-        CONFIG.login.API_HASH,
-        sequential_updates=CONFIG.live.sequential_updates,
+        cfg.login.API_ID,
+        cfg.login.API_HASH,
+        sequential_updates=cfg.live.sequential_updates,
     )
-    if CONFIG.login.user_type == 0:
-        if CONFIG.login.BOT_TOKEN == "":
+    if cfg.login.user_type == 0:
+        if cfg.login.BOT_TOKEN == "":
             logging.warning("Bot token not found, but login type is set to bot.")
             sys.exit()
-        await client.start(bot_token=CONFIG.login.BOT_TOKEN)
+        await client.start(bot_token=cfg.login.BOT_TOKEN)
     else:
         await client.start()
+
     config.is_bot = await client.is_bot()
     logging.info(f"config.is_bot={config.is_bot}")
     command_events = get_events()
@@ -145,7 +183,7 @@ async def start_sync() -> None:
     ALL_EVENTS.update(command_events)
 
     for key, val in ALL_EVENTS.items():
-        if config.CONFIG.live.delete_sync is False and key == "deleted":
+        if cfg.live.delete_sync is False and key == "deleted":
             continue
         client.add_event_handler(*val)
         logging.info(f"Added event handler for {key}")
@@ -161,5 +199,21 @@ async def start_sync() -> None:
                 ],
             )
         )
-    config.from_to = await config.load_from_to(client, config.CONFIG.forwards)
+
+    config.from_to = await config.load_from_to(client, cfg.forwards)
+
+    # Sync connections to DB
+    try:
+        from tgcf.db import sync_connections_from_config
+        sync_connections_from_config(cfg.forwards)
+        # Update source_id from from_to mapping
+        from tgcf.db import get_all_connections, update_connection_source_id
+        conns = get_all_connections()
+        for c in conns:
+            src_name = c.get("source_username", "")
+            for sid, _ in config.from_to.items():
+                update_connection_source_id(c["id"], sid)
+    except Exception as e:
+        logging.warning(f"DB sync: {e}")
+
     await client.run_until_disconnected()
