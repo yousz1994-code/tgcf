@@ -3,6 +3,7 @@
 Runs a separate bot client (BOT_TOKEN) in its own thread/event-loop
 alongside the userbot forwarding client.  All menus are inline-keyboard
 driven; a 7-step wizard handles connection creation with full validation.
+New: /broadcast (all active destinations) and /sendto (single destination).
 """
 
 import asyncio
@@ -29,6 +30,8 @@ from telethon.tl.types import (
     ChannelParticipantAdmin,
     ChannelParticipantCreator,
     Chat,
+    MessageMediaPhoto,
+    MessageMediaDocument,
     User,
 )
 
@@ -43,12 +46,18 @@ _bot_loop: Optional[asyncio.AbstractEventLoop] = None
 _bot_thread: Optional[threading.Thread] = None
 _bot_status: Dict[str, Any] = {"running": False, "error": None, "me": None}
 
-# wizard state keyed by user_id
+# wizard / broadcast / sendto state keyed by user_id
 _wizard: Dict[int, Dict] = {}
+
+# Wizard step groups
+_WIZARD_STEPS = {"wizard_source", "wizard_dest"}
+_BROADCAST_STEPS = {"broadcast_content", "broadcast_confirm"}
+_SENDTO_STEPS = {"sendto_select", "sendto_content", "sendto_confirm"}
+_ALL_STEPS = _WIZARD_STEPS | _BROADCAST_STEPS | _SENDTO_STEPS
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Helpers
+#  Security helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_admin_ids() -> List[int]:
@@ -72,6 +81,7 @@ def _get_admin_ids() -> List[int]:
 
 
 def is_admin(user_id: int) -> bool:
+    """Return True iff user_id is an authorised administrator."""
     return user_id in _get_admin_ids()
 
 
@@ -98,6 +108,8 @@ def _kb_main():
          Button.inline("📊 الإحصائيات",        b"menu:stats")],
         [Button.inline("📈 التقارير",           b"menu:reports"),
          Button.inline("🔄 إدارة الجلسة",      b"menu:session")],
+        [Button.inline("📢 بث رسالة",           b"menu:broadcast"),
+         Button.inline("🎯 إرسال مستهدف",      b"menu:sendto")],
         [Button.inline("⚙️ الإعدادات",          b"menu:settings"),
          Button.inline("👑 𝐁𝐈𝐆 𝐁𝐎𝐒𝐒",        b"menu:bigboss")],
         [Button.url("📢 قناة الدعم", "https://t.me/shaheenys"),
@@ -166,6 +178,30 @@ def _kb_back_main():
 
 def _kb_wizard_cancel():
     return [[Button.inline("❌ إلغاء المعالج", b"wizard:cancel")]]
+
+
+def _kb_broadcast_confirm():
+    return [
+        [Button.inline("✅ إرسال للجميع",  b"bc:confirm"),
+         Button.inline("❌ إلغاء",          b"bc:cancel")],
+    ]
+
+
+def _kb_sendto_confirm():
+    return [
+        [Button.inline("✅ إرسال",   b"st:confirm"),
+         Button.inline("❌ إلغاء",   b"st:cancel")],
+    ]
+
+
+def _kb_sendto_select(destinations: List[Tuple]):
+    """destinations: list of (dest_id, display_name)"""
+    rows = []
+    for i, (did, dname) in enumerate(destinations[:10]):
+        label = f"📥 {dname}"[:30]
+        rows.append([Button.inline(label, f"st:sel:{i}".encode())])
+    rows.append([Button.inline("❌ إلغاء", b"st:cancel")])
+    return rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -285,7 +321,6 @@ def _get_session_text() -> str:
 
 def _get_health_text() -> str:
     checks = []
-    # DB
     try:
         from tgcf.db import init_db, get_global_stats
         init_db()
@@ -293,7 +328,6 @@ def _get_health_text() -> str:
         checks.append("✅ قاعدة البيانات")
     except Exception as e:
         checks.append(f"❌ قاعدة البيانات: {e}")
-    # Userbot
     try:
         from tgcf.userbot import get_status
         s = get_status()
@@ -303,21 +337,25 @@ def _get_health_text() -> str:
             checks.append(f"❌ Userbot: {s.get('error')}")
     except Exception as e:
         checks.append(f"❌ Userbot: {e}")
-    # Config
     try:
         from tgcf.config import read_config
         cfg = read_config()
         checks.append(f"✅ الإعدادات (API_ID={cfg.login.API_ID})")
     except Exception as e:
         checks.append(f"❌ الإعدادات: {e}")
-    # Admin bot
     checks.append("✅ بوت الإدارة يعمل" if _bot_status.get("running") else "❌ بوت الإدارة متوقف")
     result = "\n".join(checks)
-    return f"🏥 **فحص النظام**\n━━━━━━━━━━━━━━━━━━\n{result}\n\n🕐 {_now_str()}"
+    score = result.count("✅")
+    total = len(checks)
+    return (
+        f"🏥 **فحص النظام** — درجة الصحة: `{score}/{total}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{result}\n\n🕐 {_now_str()}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Wizard helpers
+#  Wizard / state machine helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _wiz_set(uid: int, step: str, **data):
@@ -338,15 +376,23 @@ def _in_wizard(uid: int) -> bool:
     s = _wizard.get(uid, {})
     if not s:
         return False
-    # Expire after 10 min
     if time.time() - s.get("ts", 0) > 600:
         _wiz_clear(uid)
         return False
     return bool(s.get("step"))
 
 
+def _in_flow(uid: int) -> bool:
+    """True if user is in any active flow (wizard, broadcast, sendto)."""
+    return _in_wizard(uid)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Entity resolution helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def _resolve_entity(client: TelegramClient, target):
-    """Resolve a Telegram entity by username or ID. Returns (entity, id, title)."""
+    """Resolve a Telegram entity. Returns (entity, id, title)."""
     try:
         entity = await client.get_entity(target)
         if isinstance(entity, (Channel, Chat)):
@@ -373,8 +419,7 @@ async def _check_userbot_access(source) -> Tuple[bool, str]:
         if not client:
             return False, "لا يوجد عميل Userbot"
         entity, eid, title = await _resolve_entity(client, source)
-        # Try to get 1 message
-        msgs = await client.get_messages(entity, limit=1)
+        await client.get_messages(entity, limit=1)
         return True, f"✅ وصول Userbot مؤكد إلى `{title}` (ID: {eid})"
     except ValueError as e:
         return False, str(e)
@@ -403,8 +448,214 @@ async def _check_bot_access(bot_client: TelegramClient, dest) -> Tuple[bool, str
         return False, f"❌ خطأ بوت: {e}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Broadcast / SendTo helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_active_destinations() -> List[Tuple[str, str]]:
+    """Return list of (dest_id_str, display_name) from all active connections."""
+    try:
+        from tgcf.db import get_all_connections
+        conns = get_all_connections()
+        seen = set()
+        result = []
+        for c in conns:
+            if not c.get("is_active"):
+                continue
+            dest_str = c.get("dest_channels", "")
+            conn_name = c.get("con_name", "")
+            for d in dest_str.split(","):
+                d = d.strip()
+                if d and d not in seen:
+                    seen.add(d)
+                    display = conn_name or d
+                    result.append((d, display[:28]))
+        return result
+    except Exception as e:
+        log.error(f"get_active_destinations error: {e}")
+        return []
+
+
+def _detect_media_type(message) -> str:
+    """Return 'text', 'photo', 'video', or 'document'."""
+    if message.photo:
+        return "photo"
+    if message.video or (message.document and message.document.mime_type
+                         and "video" in message.document.mime_type):
+        return "video"
+    if message.document:
+        return "document"
+    return "text"
+
+
+async def _send_content_to_dest(
+    bot_client: TelegramClient,
+    dest,
+    media_type: str,
+    text: str,
+    caption: str,
+    pending_msg,
+) -> Tuple[bool, str]:
+    """Send the stored content to a single destination. Returns (ok, error)."""
+    try:
+        if media_type == "text":
+            await bot_client.send_message(dest, text, parse_mode="html")
+        else:
+            file_data = await bot_client.download_media(pending_msg, file=bytes)
+            if not file_data:
+                return False, "فشل تحميل الوسائط"
+            await bot_client.send_file(
+                dest,
+                file=file_data,
+                caption=caption or "",
+                parse_mode="html",
+            )
+        return True, ""
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            if media_type == "text":
+                await bot_client.send_message(dest, text, parse_mode="html")
+            else:
+                file_data = await bot_client.download_media(pending_msg, file=bytes)
+                await bot_client.send_file(dest, file=file_data, caption=caption or "", parse_mode="html")
+            return True, ""
+        except Exception as e2:
+            return False, str(e2)
+    except Exception as e:
+        return False, str(e)
+
+
+async def _do_broadcast(bot_client: TelegramClient, pending: Dict) -> str:
+    """Execute broadcast to all active destinations. Returns report string."""
+    destinations = _get_active_destinations()
+    if not destinations:
+        return "❌ لا توجد وجهات نشطة للبث."
+
+    media_type = pending.get("media_type", "text")
+    text = pending.get("text", "")
+    caption = pending.get("caption", "")
+    pending_msg = pending.get("pending_msg")
+
+    ok_list: List[str] = []
+    fail_list: List[str] = []
+
+    for dest_id, dest_name in destinations:
+        ok, err = await _send_content_to_dest(
+            bot_client, dest_id, media_type, text, caption, pending_msg
+        )
+        if ok:
+            ok_list.append(dest_name)
+            try:
+                from tgcf.db import log_message
+                log_message(None, "broadcast", 0, 0, "ok", f"Broadcast → {dest_name}")
+            except Exception:
+                pass
+        else:
+            fail_list.append(f"• `{dest_name}`: {err}")
+            try:
+                from tgcf.db import log_message
+                log_message(None, "broadcast", 0, 0, "fail", f"Broadcast FAIL → {dest_name}: {err}")
+            except Exception:
+                pass
+        await asyncio.sleep(0.3)
+
+    report = (
+        f"📊 **نتيجة البث**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"✅ نجح: `{len(ok_list)}`\n"
+        f"❌ فشل: `{len(fail_list)}`\n"
+        f"📊 الإجمالي: `{len(destinations)}`\n"
+    )
+    if fail_list:
+        report += "\n📋 **الوجهات الفاشلة:**\n" + "\n".join(fail_list)
+    return report
+
+
+async def _do_sendto(bot_client: TelegramClient, pending: Dict) -> str:
+    """Execute sendto for the selected destination. Returns report string."""
+    dest_id = pending.get("selected_dest", "")
+    dest_name = pending.get("selected_dest_name", str(dest_id))
+    media_type = pending.get("media_type", "text")
+    text = pending.get("text", "")
+    caption = pending.get("caption", "")
+    pending_msg = pending.get("pending_msg")
+
+    ok, err = await _send_content_to_dest(
+        bot_client, dest_id, media_type, text, caption, pending_msg
+    )
+    if ok:
+        try:
+            from tgcf.db import log_message
+            log_message(None, "sendto", 0, 0, "ok", f"SendTo → {dest_name}")
+        except Exception:
+            pass
+        return (
+            f"✅ **تم الإرسال بنجاح**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 الوجهة: `{dest_name}`\n"
+            f"📨 نوع الرسالة: `{media_type}`\n"
+            f"🕐 {_now_str()}"
+        )
+    else:
+        try:
+            from tgcf.db import log_message
+            log_message(None, "sendto", 0, 0, "fail", f"SendTo FAIL → {dest_name}: {err}")
+        except Exception:
+            pass
+        return (
+            f"❌ **فشل الإرسال**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 الوجهة: `{dest_name}`\n"
+            f"⚠️ الخطأ: `{err}`\n"
+            f"🕐 {_now_str()}"
+        )
+
+
+async def _store_pending_content(event, step_name: str, uid: int, extra: Dict = None):
+    """Parse incoming message, store in wizard state for step_name, return preview text."""
+    msg = event.message
+    media_type = _detect_media_type(msg)
+    text = (msg.text or msg.message or "").strip()
+    caption = (msg.message or "").strip() if media_type != "text" else ""
+
+    update = {
+        "pending_msg": msg,
+        "media_type": media_type,
+        "text": text,
+        "caption": caption,
+    }
+    if extra:
+        update.update(extra)
+    _wiz_set(uid, step_name, **update)
+
+    type_labels = {
+        "text": "📝 نص",
+        "photo": "🖼 صورة",
+        "video": "🎥 فيديو",
+        "document": "📄 مستند",
+    }
+    preview_text = (
+        f"👁 **معاينة المحتوى**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📌 النوع: {type_labels.get(media_type, media_type)}\n"
+    )
+    if media_type == "text":
+        preview_text += f"💬 النص:\n```\n{text[:300]}\n```\n"
+    else:
+        if caption:
+            preview_text += f"💬 التعليق:\n```\n{caption[:200]}\n```\n"
+        else:
+            preview_text += "💬 بدون تعليق\n"
+    return preview_text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Connection wizard step handler
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def _run_wizard_step(event, bot_client: TelegramClient):
-    """Handle wizard state machine for a user."""
+    """Handle wizard / broadcast / sendto state machines for a user."""
     uid = event.sender_id
     state = _wiz_get(uid)
     step = state.get("step", "")
@@ -412,13 +663,39 @@ async def _run_wizard_step(event, bot_client: TelegramClient):
 
     if text.lower() in ("/cancel", "إلغاء", "cancel"):
         _wiz_clear(uid)
-        await event.respond("❌ تم إلغاء المعالج.", buttons=_kb_main())
+        await event.respond("❌ تم الإلغاء.", buttons=_kb_main())
         return
 
-    # ── Step 1: got source ───────────────────────────────────────────────────
+    # ── Broadcast: collecting content ─────────────────────────────────────
+    if step == "broadcast_content":
+        preview_text = await _store_pending_content(event, "broadcast_confirm", uid)
+        await event.respond(
+            f"{preview_text}\n"
+            f"📢 سيتم إرسال هذه الرسالة إلى **جميع الوجهات النشطة**.\n"
+            f"هل تريد المتابعة؟",
+            buttons=_kb_broadcast_confirm()
+        )
+        return
+
+    # ── SendTo: collecting content ──────────────────────────────────────
+    if step == "sendto_content":
+        selected_dest = state.get("selected_dest", "")
+        selected_name = state.get("selected_dest_name", "")
+        preview_text = await _store_pending_content(
+            event, "sendto_confirm", uid,
+            extra={"selected_dest": selected_dest, "selected_dest_name": selected_name}
+        )
+        await event.respond(
+            f"{preview_text}\n"
+            f"🎯 الوجهة المختارة: `{selected_name}`\n"
+            f"هل تريد المتابعة؟",
+            buttons=_kb_sendto_confirm()
+        )
+        return
+
+    # ── Connection wizard: Step 1 — got source ────────────────────────────
     if step == "wizard_source":
         await event.respond("⏳ جاري التحقق من المصدر...")
-        # Validate via userbot
         ok, msg = await _check_userbot_access(text)
         if not ok:
             await event.respond(
@@ -435,18 +712,14 @@ async def _run_wizard_step(event, bot_client: TelegramClient):
         )
         return
 
-    # ── Step 2: got dest ─────────────────────────────────────────────────────
+    # ── Connection wizard: Step 2 — got dest ─────────────────────────────
     if step == "wizard_dest":
         source = state.get("source")
         await event.respond("⏳ جاري التحقق من الهدف والصلاحيات...")
 
-        # Step 3: check userbot on source
         ub_ok, ub_msg = await _check_userbot_access(source)
-
-        # Step 4: check bot on dest
         bot_ok, bot_msg = await _check_bot_access(bot_client, text)
 
-        # Step 5 & 6: build validation report
         src_check = state.get("source_check", ub_msg)
         report_lines = [
             "📋 **تقرير التحقق**\n━━━━━━━━━━━━━━━━━━",
@@ -460,23 +733,18 @@ async def _run_wizard_step(event, bot_client: TelegramClient):
         if not all_ok:
             report_lines.append("\n❌ **الاتصال لم يُحفظ** — الرجاء إصلاح المشاكل أعلاه وحاول مجدداً.")
             _wiz_clear(uid)
-            await event.respond(
-                "\n".join(report_lines),
-                buttons=_kb_main()
-            )
+            await event.respond("\n".join(report_lines), buttons=_kb_main())
             return
 
         report_lines.append("✅ **اختبار الاتصال: ناجح**")
         report_lines.append("\n✅ **جميع الفحوصات نجحت — جاري حفظ الاتصال...**")
 
-        # Step 7: save connection
         try:
             from tgcf.config import read_config, write_config, Forward
             from tgcf.db import upsert_connection, init_db
             init_db()
             cfg = read_config()
 
-            # Resolve IDs
             from tgcf.userbot import get_client as ub_get_client
             ub_client = ub_get_client()
 
@@ -485,23 +753,13 @@ async def _run_wizard_step(event, bot_client: TelegramClient):
 
             con_name = f"{src_title[:20]}_to_{dest_title[:20]}"
 
-            # Add to config forwards
-            new_fwd = Forward(
-                con_name=con_name,
-                source=src_id,
-                dest=[dest_id],
-                use_this=True
-            )
-            # Remove duplicate
+            new_fwd = Forward(con_name=con_name, source=src_id, dest=[dest_id], use_this=True)
             cfg.forwards = [f for f in cfg.forwards if str(f.source) != str(src_id)]
             cfg.forwards.append(new_fwd)
             write_config(cfg)
 
-            # Save to DB
-            db_dest = str(dest_id)
-            cid = upsert_connection(con_name, source, src_id, db_dest, True)
+            cid = upsert_connection(con_name, source, src_id, str(dest_id), True)
 
-            # Reload forwarding map if possible
             try:
                 from tgcf import config as tgcf_config
                 if hasattr(tgcf_config, "from_to"):
@@ -559,9 +817,12 @@ async def cmd_help(event):
         "/reports — التقارير\n"
         "/userbot — حالة Userbot\n"
         "/session — معلومات الجلسة\n"
+        "/broadcast — بث رسالة لجميع الوجهات\n"
+        "/sendto — إرسال لوجهة محددة\n"
         "/restart_userbot — إعادة تشغيل Userbot\n"
         "/reload_connections — إعادة تحميل الروابط\n"
-        "/ping — اختبار الاستجابة\n"
+        "/ping — اختبار الاستجابة\n\n"
+        "**جميع الأوامر محمية — للمديرين المصرح لهم فقط.**"
     )
     await event.respond(text, buttons=_kb_back_main())
     raise events.StopPropagation
@@ -584,10 +845,7 @@ async def cmd_health(event):
 async def cmd_connections(event):
     if not is_admin(event.sender_id):
         raise events.StopPropagation
-    await event.respond(
-        "🔗 **إدارة الروابط**\nاختر إجراءً:",
-        buttons=_kb_connections()
-    )
+    await event.respond("🔗 **إدارة الروابط**\nاختر إجراءً:", buttons=_kb_connections())
     raise events.StopPropagation
 
 
@@ -609,6 +867,64 @@ async def cmd_session(event):
     if not is_admin(event.sender_id):
         raise events.StopPropagation
     await event.respond(_get_session_text(), buttons=_kb_session())
+    raise events.StopPropagation
+
+
+async def cmd_broadcast(event):
+    if not is_admin(event.sender_id):
+        raise events.StopPropagation
+    uid = event.sender_id
+
+    dests = _get_active_destinations()
+    if not dests:
+        await event.respond(
+            "❌ **لا توجد وجهات نشطة**\n\n"
+            "يرجى إضافة روابط نشطة أولاً عبر `/connections`.",
+            buttons=_kb_back_main()
+        )
+        raise events.StopPropagation
+
+    dest_list = "\n".join(f"  • `{name}`" for _, name in dests[:10])
+    if len(dests) > 10:
+        dest_list += f"\n  _...و{len(dests)-10} وجهات أخرى_"
+
+    _wiz_set(uid, "broadcast_content")
+    await event.respond(
+        f"📢 **بث رسالة**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"الوجهات النشطة ({len(dests)}):\n{dest_list}\n\n"
+        f"**أرسل المحتوى الذي تريد بثّه:**\n"
+        f"• نص (مع دعم HTML و Markdown)\n"
+        f"• صورة (مع تعليق اختياري)\n"
+        f"• فيديو (مع تعليق اختياري)\n"
+        f"• مستند (مع تعليق اختياري)\n\n"
+        f"أرسل /cancel للإلغاء.",
+        buttons=_kb_wizard_cancel()
+    )
+    raise events.StopPropagation
+
+
+async def cmd_sendto(event):
+    if not is_admin(event.sender_id):
+        raise events.StopPropagation
+    uid = event.sender_id
+
+    dests = _get_active_destinations()
+    if not dests:
+        await event.respond(
+            "❌ **لا توجد وجهات نشطة**\n\n"
+            "يرجى إضافة روابط نشطة أولاً عبر `/connections`.",
+            buttons=_kb_back_main()
+        )
+        raise events.StopPropagation
+
+    _wiz_set(uid, "sendto_select", destinations=dests)
+    await event.respond(
+        f"🎯 **إرسال مستهدف**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"اختر الوجهة ({len(dests)} متاحة):",
+        buttons=_kb_sendto_select(dests)
+    )
     raise events.StopPropagation
 
 
@@ -653,7 +969,7 @@ async def cmd_ping(event):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Message handler (wizard + fallback)
+#  Message handler (wizard + broadcast + sendto + fallback)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _make_message_handler(bot_client: TelegramClient):
@@ -663,11 +979,10 @@ async def _make_message_handler(bot_client: TelegramClient):
         uid = event.sender_id
         text = (event.message.text or "").strip()
 
-        # Skip commands (handled separately)
         if text.startswith("/"):
             return
 
-        if _in_wizard(uid):
+        if _in_flow(uid):
             await _run_wizard_step(event, bot_client)
         else:
             await event.respond("👈 استخدم /start للوصول إلى القائمة الرئيسية.", buttons=_kb_main())
@@ -692,13 +1007,10 @@ async def _make_callback_handler(bot_client: TelegramClient):
         sub = parts[1] if len(parts) > 1 else ""
         param = parts[2] if len(parts) > 2 else ""
 
-        # ── menu navigation ──────────────────────────────────────────────────
+        # ── menu navigation ───────────────────────────────────────────────
         if action == "menu":
             if sub == "main":
-                await event.edit(
-                    "👑 **القائمة الرئيسية**\nاختر من الخيارات أدناه:",
-                    buttons=_kb_main()
-                )
+                await event.edit("👑 **القائمة الرئيسية**\nاختر من الخيارات أدناه:", buttons=_kb_main())
             elif sub == "connections":
                 await event.edit("🔗 **إدارة الروابط**:", buttons=_kb_connections())
             elif sub == "my_connections":
@@ -730,9 +1042,44 @@ async def _make_callback_handler(bot_client: TelegramClient):
                     f"{_get_health_text()}",
                     buttons=_kb_back_main()
                 )
+            elif sub == "broadcast":
+                # Start broadcast flow from menu button
+                dests = _get_active_destinations()
+                if not dests:
+                    await event.edit(
+                        "❌ لا توجد وجهات نشطة. أضف روابط أولاً.",
+                        buttons=_kb_back_main()
+                    )
+                else:
+                    dest_list = "\n".join(f"  • `{name}`" for _, name in dests[:10])
+                    _wiz_set(uid, "broadcast_content")
+                    await event.answer()
+                    await event.respond(
+                        f"📢 **بث رسالة**\n━━━━━━━━━━━━━━━━━━\n"
+                        f"الوجهات النشطة ({len(dests)}):\n{dest_list}\n\n"
+                        f"**أرسل المحتوى الذي تريد بثّه:**\n"
+                        f"أرسل /cancel للإلغاء.",
+                        buttons=_kb_wizard_cancel()
+                    )
+                    return
+            elif sub == "sendto":
+                dests = _get_active_destinations()
+                if not dests:
+                    await event.edit(
+                        "❌ لا توجد وجهات نشطة. أضف روابط أولاً.",
+                        buttons=_kb_back_main()
+                    )
+                else:
+                    _wiz_set(uid, "sendto_select", destinations=dests)
+                    await event.edit(
+                        f"🎯 **إرسال مستهدف**\n━━━━━━━━━━━━━━━━━━\n"
+                        f"اختر الوجهة ({len(dests)} متاحة):",
+                        buttons=_kb_sendto_select(dests)
+                    )
+                    return
             await event.answer()
 
-        # ── wizard ───────────────────────────────────────────────────────────
+        # ── wizard ────────────────────────────────────────────────────────
         elif action == "wizard":
             if sub == "start":
                 _wiz_set(uid, "wizard_source")
@@ -751,7 +1098,64 @@ async def _make_callback_handler(bot_client: TelegramClient):
                 await event.edit("❌ تم إلغاء المعالج.", buttons=_kb_main())
                 await event.answer()
 
-        # ── connection actions ───────────────────────────────────────────────
+        # ── broadcast confirm / cancel ────────────────────────────────────
+        elif action == "bc":
+            state = _wiz_get(uid)
+            if state.get("step") != "broadcast_confirm":
+                await event.answer("⚠️ انتهت جلسة البث. استخدم /broadcast من جديد.", alert=True)
+                return
+            if sub == "cancel":
+                _wiz_clear(uid)
+                await event.edit("❌ تم إلغاء البث.", buttons=_kb_main())
+                await event.answer()
+            elif sub == "confirm":
+                await event.answer("📢 جاري البث...")
+                await event.edit("⏳ **جاري إرسال الرسالة للجميع...**\nيرجى الانتظار.")
+                pending = dict(state)
+                _wiz_clear(uid)
+                report = await _do_broadcast(bot_client, pending)
+                await event.edit(report, buttons=_kb_back_main())
+
+        # ── sendto: select destination ────────────────────────────────────
+        elif action == "st":
+            if sub == "cancel":
+                _wiz_clear(uid)
+                await event.edit("❌ تم الإلغاء.", buttons=_kb_main())
+                await event.answer()
+
+            elif sub == "sel" and param:
+                state = _wiz_get(uid)
+                destinations = state.get("destinations", [])
+                try:
+                    idx = int(param)
+                    dest_id, dest_name = destinations[idx]
+                except (IndexError, ValueError):
+                    await event.answer("❌ وجهة غير صالحة.", alert=True)
+                    return
+                _wiz_set(uid, "sendto_content",
+                         selected_dest=dest_id, selected_dest_name=dest_name)
+                await event.answer()
+                await event.edit(
+                    f"🎯 **الوجهة المختارة:** `{dest_name}`\n\n"
+                    f"**أرسل المحتوى الذي تريد إرساله:**\n"
+                    f"• نص، صورة، فيديو، أو مستند\n\n"
+                    f"أرسل /cancel للإلغاء.",
+                    buttons=_kb_wizard_cancel()
+                )
+
+            elif sub == "confirm":
+                state = _wiz_get(uid)
+                if state.get("step") != "sendto_confirm":
+                    await event.answer("⚠️ انتهت الجلسة. استخدم /sendto من جديد.", alert=True)
+                    return
+                await event.answer("🎯 جاري الإرسال...")
+                await event.edit("⏳ **جاري الإرسال...**")
+                pending = dict(state)
+                _wiz_clear(uid)
+                report = await _do_sendto(bot_client, pending)
+                await event.edit(report, buttons=_kb_back_main())
+
+        # ── connection actions ────────────────────────────────────────────
         elif action == "conn":
             if sub == "list":
                 try:
@@ -807,7 +1211,7 @@ async def _make_callback_handler(bot_client: TelegramClient):
                     cid = int(param)
                     c = get_connection_by_id(cid)
                     logs = get_recent_activity(cid, 5)
-                    name = c.get("con_name") or f"#{cid}" if c else f"#{cid}"
+                    name = (c.get("con_name") or f"#{cid}") if c else f"#{cid}"
                     lines = [f"📊 **آخر 5 سجلات — {name}**\n━━━━━━━━━━━━━━━━━━"]
                     for lg in logs:
                         s = "✅" if lg.get("status") == "ok" else "❌"
@@ -817,7 +1221,10 @@ async def _make_callback_handler(bot_client: TelegramClient):
                         lines.append(f"{s} `{ts}` → `{prev}`")
                     if not logs:
                         lines.append("لا توجد سجلات.")
-                    await event.edit("\n".join(lines), buttons=[[Button.inline("◀️ رجوع", f"conn:detail:{param}".encode())]])
+                    await event.edit(
+                        "\n".join(lines),
+                        buttons=[[Button.inline("◀️ رجوع", f"conn:detail:{param}".encode())]]
+                    )
                 except Exception as e:
                     await event.edit(f"❌ خطأ: {e}", buttons=_kb_back_main())
                 await event.answer()
@@ -826,11 +1233,11 @@ async def _make_callback_handler(bot_client: TelegramClient):
                 await event.answer("🔄 جاري الاختبار...")
                 try:
                     from tgcf.db import get_connection_by_id
-                    from tgcf.userbot import get_status, test_connection
+                    from tgcf.userbot import test_connection
                     cid = int(param)
                     c = get_connection_by_id(cid)
                     name = c.get("con_name") if c else f"#{cid}"
-                    src = c.get("source_username") or str(c.get("source_id")) if c else "?"
+                    src = (c.get("source_username") or str(c.get("source_id"))) if c else "?"
                     ub_ok, ub_msg = await _check_userbot_access(src)
                     ub_conn_ok, ub_conn_msg = test_connection()
                     result = (
@@ -875,7 +1282,6 @@ async def _make_callback_handler(bot_client: TelegramClient):
                     c = get_connection_by_id(cid)
                     src_id = c.get("source_id") if c else None
                     delete_connection(cid)
-                    # Remove from config
                     if src_id:
                         cfg = read_config()
                         cfg.forwards = [f for f in cfg.forwards if int(f.source) != int(src_id)]
@@ -899,7 +1305,7 @@ async def _make_callback_handler(bot_client: TelegramClient):
                     await event.edit(f"❌ خطأ في المزامنة: {e}", buttons=_kb_back_main())
                 await event.answer()
 
-        # ── userbot actions ──────────────────────────────────────────────────
+        # ── userbot actions ───────────────────────────────────────────────
         elif action == "ub":
             if sub == "status":
                 await event.edit(_get_userbot_text(), buttons=_kb_userbot())
@@ -922,7 +1328,7 @@ async def _make_callback_handler(bot_client: TelegramClient):
                     await event.edit(f"❌ خطأ: {e}", buttons=_kb_userbot())
             await event.answer()
 
-        # ── session actions ──────────────────────────────────────────────────
+        # ── session actions ───────────────────────────────────────────────
         elif action == "sess":
             if sub == "info":
                 await event.edit(_get_session_text(), buttons=_kb_session())
@@ -963,7 +1369,6 @@ async def _run_bot():
     api_id = int(api_id_str)
 
     try:
-        # Use in-memory StringSession to avoid SQLite file locking
         _bot_client = TelegramClient(StringSession(), api_id, api_hash)
         await _bot_client.start(bot_token=bot_token)
         me = await _bot_client.get_me()
@@ -976,21 +1381,23 @@ async def _run_bot():
         }
         log.info(f"Admin bot started: @{me.username}")
 
-        # Register handlers
-        _bot_client.add_event_handler(cmd_start,   events.NewMessage(pattern=r"(?i)/start"))
-        _bot_client.add_event_handler(cmd_help,    events.NewMessage(pattern=r"(?i)/help"))
-        _bot_client.add_event_handler(cmd_stats,   events.NewMessage(pattern=r"(?i)/stats"))
-        _bot_client.add_event_handler(cmd_health,  events.NewMessage(pattern=r"(?i)/health"))
-        _bot_client.add_event_handler(cmd_connections, events.NewMessage(pattern=r"(?i)/connections"))
-        _bot_client.add_event_handler(cmd_reports, events.NewMessage(pattern=r"(?i)/reports"))
-        _bot_client.add_event_handler(cmd_userbot, events.NewMessage(pattern=r"(?i)/userbot"))
-        _bot_client.add_event_handler(cmd_session, events.NewMessage(pattern=r"(?i)/session"))
-        _bot_client.add_event_handler(cmd_restart_userbot, events.NewMessage(pattern=r"(?i)/restart_userbot"))
+        # Register command handlers (in order — specific before generic)
+        _bot_client.add_event_handler(cmd_start,              events.NewMessage(pattern=r"(?i)/start"))
+        _bot_client.add_event_handler(cmd_help,               events.NewMessage(pattern=r"(?i)/help"))
+        _bot_client.add_event_handler(cmd_stats,              events.NewMessage(pattern=r"(?i)/stats"))
+        _bot_client.add_event_handler(cmd_health,             events.NewMessage(pattern=r"(?i)/health"))
+        _bot_client.add_event_handler(cmd_connections,        events.NewMessage(pattern=r"(?i)/connections"))
+        _bot_client.add_event_handler(cmd_reports,            events.NewMessage(pattern=r"(?i)/reports"))
+        _bot_client.add_event_handler(cmd_userbot,            events.NewMessage(pattern=r"(?i)/userbot"))
+        _bot_client.add_event_handler(cmd_session,            events.NewMessage(pattern=r"(?i)/session"))
+        _bot_client.add_event_handler(cmd_broadcast,          events.NewMessage(pattern=r"(?i)/broadcast"))
+        _bot_client.add_event_handler(cmd_sendto,             events.NewMessage(pattern=r"(?i)/sendto"))
+        _bot_client.add_event_handler(cmd_restart_userbot,    events.NewMessage(pattern=r"(?i)/restart_userbot"))
         _bot_client.add_event_handler(cmd_reload_connections, events.NewMessage(pattern=r"(?i)/reload_connections"))
-        _bot_client.add_event_handler(cmd_ping,    events.NewMessage(pattern=r"(?i)/ping"))
+        _bot_client.add_event_handler(cmd_ping,               events.NewMessage(pattern=r"(?i)/ping"))
 
         msg_handler = await _make_message_handler(_bot_client)
-        cb_handler = await _make_callback_handler(_bot_client)
+        cb_handler  = await _make_callback_handler(_bot_client)
 
         _bot_client.add_event_handler(msg_handler, events.NewMessage())
         _bot_client.add_event_handler(cb_handler,  events.CallbackQuery())
@@ -1016,18 +1423,23 @@ def start_admin_bot():
         return
     _bot_loop = asyncio.new_event_loop()
     _bot_thread = threading.Thread(
-        target=_thread_target, args=(_bot_loop,), daemon=True, name="AdminBot"
+        target=_thread_target,
+        args=(_bot_loop,),
+        daemon=True,
+        name="admin-bot-thread",
     )
     _bot_thread.start()
     log.info("Admin bot thread started.")
 
 
+def stop_admin_bot():
+    """Gracefully stop the admin bot."""
+    global _bot_client, _bot_loop, _bot_status
+    _bot_status["running"] = False
+    if _bot_client and _bot_loop and _bot_loop.is_running():
+        asyncio.run_coroutine_threadsafe(_bot_client.disconnect(), _bot_loop)
+    log.info("Admin bot stopped.")
+
+
 def get_bot_status() -> Dict[str, Any]:
     return dict(_bot_status)
-
-
-def stop_admin_bot():
-    global _bot_client, _bot_loop
-    if _bot_loop and _bot_client:
-        asyncio.run_coroutine_threadsafe(_bot_client.disconnect(), _bot_loop)
-    _bot_status["running"] = False

@@ -34,3 +34,14 @@ File-based sessions cause "database is locked" when Streamlit and tgcf live both
 ## Auto-start admin bot
 `0_👋_Hello.py` calls `start_admin_bot()` on first Streamlit load so the bot is available without running tgcf live mode.
 `live.py:start_sync()` also calls `start_admin_bot()` so it also runs in live forwarding mode.
+
+## GitHub Push — Requires PAT
+`git push origin main` fails with "Password authentication is not supported" — HTTPS remote needs a GitHub PAT.
+To push: configure `GITHUB_TOKEN` secret or use `git remote set-url origin https://<token>@github.com/yousz1994-code/tgcf.git`.
+
+## Broadcast / SendTo Architecture
+`/broadcast` and `/sendto` use the same `_wizard` state machine dict.
+States: `broadcast_content` → user sends media → `broadcast_confirm` → callback `bc:confirm` → `_do_broadcast()`.
+States: `sendto_select` → callback `st:sel:{i}` → `sendto_content` → user sends media → `sendto_confirm` → `st:confirm` → `_do_sendto()`.
+Media is downloaded from bot with `download_media(msg, file=bytes)` then re-uploaded to destinations.
+All deliveries logged to `message_logs` DB table with status ok/fail.

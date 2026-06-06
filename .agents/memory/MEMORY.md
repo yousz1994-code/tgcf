@@ -1,3 +1,3 @@
-- [tgcf-project-setup](tgcf-setup.md) — Streamlit 1.25.0 limits + admin bot MUST use StringSession() not file session (prevents SQLite lock)
+- [tgcf-project-setup](tgcf-setup.md) — Streamlit 1.25.0 limits, admin bot MUST use StringSession(), GitHub push needs PAT, broadcast/sendto arch
 - [userbot-session](userbot-session.md) — Userbot @Y9_S4 id=8511180085; SESSION_STRING in Replit Secrets; auto-connects via tgcf/userbot.py on import
 - [db-layer](db-layer.md) — PostgreSQL via DATABASE_URL; tables: connections + message_logs; initialized in tgcf/db.py on import
